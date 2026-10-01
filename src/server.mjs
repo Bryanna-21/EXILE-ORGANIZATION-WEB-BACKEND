@@ -16,20 +16,35 @@ const HOSTS = (E.ALLOWED_DOWNLOAD_HOSTS || '').split(',').map(s => s.trim().toLo
 const TTL = num(E.SESSION_TTL_HOURS, 12) * 3600e3;
 if (PROD && SECRET.length < 32) { console.error('ADMIN_SESSION_SECRET must be >=32 chars in production'); process.exit(1); }
 
-// ---------- DB + migrations ----------
+// ---------- DB adapter + migrations ----------
+// node:sqlite is unavailable on Wasmer Edge (Edge.js); fall back to node-sqlite3-wasm there.
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
+async function openDb() {
+  const want = (E.DB_DRIVER || 'auto').toLowerCase();
+  if (want !== 'wasm') {
+    try {
+      const { DatabaseSync } = await import('node:sqlite');
+      const d = new DatabaseSync(DB_PATH); d.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
+      console.log('DB driver: node:sqlite');
+      return { all: (s, a) => d.prepare(s).all(...a), get: (s, a) => d.prepare(s).get(...a), run: (s, a) => d.prepare(s).run(...a), exec: s => d.exec(s) };
+    } catch (e) { if (want === 'node') throw e; console.warn('node:sqlite unavailable, falling back to node-sqlite3-wasm'); }
+  }
+  const mod = await import('node-sqlite3-wasm'); const Database = mod.Database ?? mod.default?.Database ?? mod.default;
+  const d = new Database(DB_PATH); d.exec('PRAGMA foreign_keys=ON;');
+  console.log('DB driver: node-sqlite3-wasm');
+  return { all: (s, a) => d.all(s, a), get: (s, a) => d.get(s, a) ?? undefined, run: (s, a) => d.run(s, a), exec: s => d.exec(s) };
+}
+const db = await openDb();
+const q = (sql, ...a) => db.all(sql, a), one = (sql, ...a) => db.get(sql, a), run = (sql, ...a) => db.run(sql, a);
 export function migrate() {
   db.exec('CREATE TABLE IF NOT EXISTS _migrations(name TEXT PRIMARY KEY)');
   const dir = new URL('../migrations/', import.meta.url);
   for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort()) {
-    if (db.prepare('SELECT 1 FROM _migrations WHERE name=?').get(f)) continue;
-    db.exec('BEGIN'); try { db.exec(fs.readFileSync(new URL(f, dir), 'utf8')); db.prepare('INSERT INTO _migrations VALUES(?)').run(f); db.exec('COMMIT'); console.log('migrated', f); } catch (e) { db.exec('ROLLBACK'); throw e; }
+    if (one('SELECT 1 x FROM _migrations WHERE name=?', f)) continue;
+    db.exec('BEGIN'); try { db.exec(fs.readFileSync(new URL(f, dir), 'utf8')); run('INSERT INTO _migrations VALUES(?)', f); db.exec('COMMIT'); console.log('migrated', f); } catch (e) { db.exec('ROLLBACK'); throw e; }
   }
 }
 migrate();
-const q = (sql, ...a) => db.prepare(sql).all(...a), one = (sql, ...a) => db.prepare(sql).get(...a), run = (sql, ...a) => db.prepare(sql).run(...a);
 
 // ---------- crypto ----------
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
@@ -37,6 +52,7 @@ const hashPw = pw => { const salt = crypto.randomBytes(16); return `scrypt$${sal
 const checkPw = (pw, h) => { const [, s, k] = h.split('$'); const d = crypto.scryptSync(pw, Buffer.from(s, 'hex'), 64); return crypto.timingSafeEqual(d, Buffer.from(k, 'hex')); };
 const DUMMY = hashPw('dummy-password-for-timing');
 
+if (process.argv.includes('--migrate-only')) process.exit(0);
 if (process.argv.includes('--create-admin')) {
   const email = (E.ADMIN_BOOTSTRAP_EMAIL || '').toLowerCase(), pw = E.ADMIN_BOOTSTRAP_PASSWORD || '';
   if (!email.includes('@') || pw.length < 12) { console.error('Set ADMIN_BOOTSTRAP_EMAIL and ADMIN_BOOTSTRAP_PASSWORD (>=12 chars).'); process.exit(1); }
@@ -44,6 +60,10 @@ if (process.argv.includes('--create-admin')) {
   if (ex) run('UPDATE admins SET password_hash=?,failed=0,locked_until=0 WHERE id=?', hashPw(pw), ex.id); else run('INSERT INTO admins(email,password_hash) VALUES(?,?)', email, hashPw(pw));
   console.log(ex ? 'SuperAdmin password reset.' : 'SuperAdmin created.'); process.exit(0);
 }
+
+// Auto-bootstrap: only when NO admin exists and bootstrap env vars are set (useful where there is no shell).
+{ const em = (E.ADMIN_BOOTSTRAP_EMAIL || '').toLowerCase(), pw = E.ADMIN_BOOTSTRAP_PASSWORD || '';
+  if (!one('SELECT 1 x FROM admins') && em.includes('@') && pw.length >= 12) { run('INSERT INTO admins(email,password_hash) VALUES(?,?)', em, hashPw(pw)); console.log('First SuperAdmin created. Remove ADMIN_BOOTSTRAP_PASSWORD from env now.'); } }
 
 // ---------- helpers ----------
 class HttpError extends Error { constructor(s, m) { super(m); this.status = s; } }
