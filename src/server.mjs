@@ -20,7 +20,8 @@ if (PROD && SECRET.length < 32) { console.error('ADMIN_SESSION_SECRET must be >=
 // node:sqlite is unavailable on Wasmer Edge (Edge.js); fall back to node-sqlite3-wasm there.
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 async function openDb() {
-  const want = (E.DB_DRIVER || 'auto').toLowerCase();
+  const want = (E.DB_DRIVER || 'wasm').toLowerCase(); // default wasm: Edge.js crashes on node:sqlite
+  console.log('DB driver requested:', want);
   if (want !== 'wasm') {
     try {
       const { DatabaseSync } = await import('node:sqlite');
