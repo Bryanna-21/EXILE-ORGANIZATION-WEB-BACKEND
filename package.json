@@ -4,7 +4,7 @@
  "private": true,
  "type": "module",
  "engines": {
-  "node": ">=22.5"
+  "node": ">=22"
  },
  "scripts": {
   "start": "node src/server.mjs",
@@ -13,6 +13,6 @@
   "test": "node --disable-warning=ExperimentalWarning --test test/api.test.mjs"
  },
  "dependencies": {
-  "node-sqlite3-wasm": ">=0.8.0"
+  "@libsql/client": "^0.15.0"
  }
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 const P = 8899, B = `http://localhost:${P}`, DB = './data/test.db';
-const env = { ...process.env, DB_DRIVER: 'node', PORT: P, DATABASE_URL: DB, CORS_ORIGINS: 'http://a.test', PUBLIC_SITE_URL: 'http://a.test', API_URL: B, ADMIN_SESSION_SECRET: 'x'.repeat(40), ALLOWED_DOWNLOAD_HOSTS: 'github.com', ADMIN_BOOTSTRAP_EMAIL: 't@x.io', ADMIN_BOOTSTRAP_PASSWORD: 'correct-horse-battery', LOGIN_RATE_LIMIT_PER_MIN: '50' };
+const env = { ...process.env, PORT: P, DATABASE_URL: DB, CORS_ORIGINS: 'http://a.test', PUBLIC_SITE_URL: 'http://a.test', API_URL: B, ADMIN_SESSION_SECRET: 'x'.repeat(40), ALLOWED_DOWNLOAD_HOSTS: 'github.com', ADMIN_BOOTSTRAP_EMAIL: 't@x.io', ADMIN_BOOTSTRAP_PASSWORD: 'correct-horse-battery', LOGIN_RATE_LIMIT_PER_MIN: '50' };
 let srv, cookie, csrf;
 const H = { 'content-type': 'application/json', origin: 'http://a.test' };
 const api = (m, p, b, h = {}) => fetch(B + p, { method: m, redirect: 'manual', headers: { ...H, ...(cookie ? { cookie } : {}), ...(csrf ? { 'x-csrf-token': csrf } : {}), ...h }, body: b ? JSON.stringify(b) : undefined });
