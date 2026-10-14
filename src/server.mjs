@@ -152,7 +152,10 @@ async function stats() {
 
 // ---------- router ----------
 export default async function handler(req, res) {
-  const url = new URL(req.url, 'http://x'), p = url.pathname.replace(/\/+$/, '') || '/', m = req.method, origin = req.headers.origin;
+  // Vercel rewrites every path to /api/index?__p=<original path>; recover the real path + query.
+  let rawUrl = req.url;
+  { const u0 = new URL(rawUrl, 'http://x'); if (u0.pathname.startsWith('/api/index')) { const pp = u0.searchParams.get('__p'); u0.searchParams.delete('__p'); const qs = u0.searchParams.toString(); rawUrl = '/' + (pp || '').replace(/^\/+/, '') + (qs ? '?' + qs : ''); } }
+  const url = new URL(rawUrl, 'http://x'), p = url.pathname.replace(/\/+$/, '') || '/', m = req.method, origin = req.headers.origin;
   const sec = { 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'strict-origin-when-cross-origin', 'content-security-policy': "default-src 'none'; frame-ancestors 'none'", 'cross-origin-resource-policy': 'cross-origin', ...(PROD ? { 'strict-transport-security': 'max-age=31536000; includeSubDomains' } : {}) };
   for (const [k, v] of Object.entries(sec)) res.setHeader(k, v);
   if (origin && CORS.includes(origin)) { res.setHeader('access-control-allow-origin', origin); res.setHeader('access-control-allow-credentials', 'true'); res.setHeader('vary', 'Origin'); res.setHeader('access-control-allow-headers', 'content-type,x-csrf-token'); res.setHeader('access-control-allow-methods', 'GET,POST,PUT,DELETE,OPTIONS'); }
