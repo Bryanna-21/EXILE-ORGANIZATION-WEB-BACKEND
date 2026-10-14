@@ -68,6 +68,17 @@ if (process.argv.includes('--create-admin')) {
 { const em = (E.ADMIN_BOOTSTRAP_EMAIL || '').toLowerCase(), pw = E.ADMIN_BOOTSTRAP_PASSWORD || '';
   if (!(await one('SELECT 1 x FROM admins')) && em.includes('@') && pw.length >= 12) { (await run('INSERT INTO admins(email,password_hash) VALUES(?,?)', em, hashPw(pw))); console.log('First SuperAdmin created. Remove ADMIN_BOOTSTRAP_PASSWORD from env now.'); } }
 
+// ---------- email (Resend HTTPS API; no extra dependency) ----------
+const otpHash = (adminId, code) => sha(`${SECRET}|otp|${adminId}|${code}`);
+async function sendMail(to, subject, text) {
+  if (!E.RESEND_API_KEY) { console.warn('RESEND_API_KEY not set: email not sent'); return false; }
+  try {
+    const r = await fetch(E.RESEND_API_URL || 'https://api.resend.com/emails', { method: 'POST', headers: { authorization: `Bearer ${E.RESEND_API_KEY}`, 'content-type': 'application/json' }, body: JSON.stringify({ from: E.MAIL_FROM || 'Exile Admin <onboarding@resend.dev>', to: [to], subject, text }) });
+    if (!r.ok) { console.error('mail failed', r.status, (await r.text()).slice(0, 200)); return false; }
+    return true;
+  } catch (e) { console.error('mail error', e.message); return false; }
+}
+
 // ---------- helpers ----------
 class HttpError extends Error { constructor(s, m) { super(m); this.status = s; } }
 const bad = (m = 'Invalid input') => new HttpError(400, m);
@@ -206,6 +217,41 @@ export default async function handler(req, res) {
       (await run('INSERT INTO admin_sessions(admin_id,token_hash,csrf,expires_at) VALUES(?,?,?,?)', a.id, sha(tok), csrf, Date.now() + TTL));
       await audit(a, 'login', 'admin', a.id);
       return send(res, 200, { email: a.email, role: a.role, csrf }, { 'set-cookie': cookie(tok, TTL / 1000) });
+    }
+    // ---- password reset (email OTP) ----
+    if (ap === '/forgot' && m === 'POST') {
+      if (limited('f|' + ip(req), 5)) throw new HttpError(429, 'Too many requests');
+      if (origin && !CORS.includes(origin)) throw new HttpError(403, 'Forbidden');
+      const b = await body(req), email = String(b.email || '').toLowerCase().trim(), generic = { ok: true, message: 'If that email belongs to an admin, a 6-digit code has been sent. It expires in 10 minutes.' };
+      const a = email.includes('@') ? await one('SELECT * FROM admins WHERE email=?', email) : null;
+      if (!a) { await new Promise(r => setTimeout(r, 500)); return send(res, 200, generic); }
+      const recent = (await one('SELECT COUNT(*) c FROM password_resets WHERE admin_id=? AND created_at>?', a.id, Date.now() - 3600e3)).c;
+      if (recent >= 3) return send(res, 200, generic); // max 3 codes per hour; silent so it can't be probed
+      const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+      await run('UPDATE password_resets SET used=1 WHERE admin_id=?', a.id); // only the newest code is valid
+      await run('INSERT INTO password_resets(admin_id,code_hash,expires_at,created_at) VALUES(?,?,?,?)', a.id, otpHash(a.id, code), Date.now() + 10 * 60e3, Date.now());
+      const sent = await sendMail(a.email, 'Your Exile Admin reset code', `Your Exile Admin password reset code is ${code}\n\nIt expires in 10 minutes. If you did not ask for this, ignore this email; your password has not changed.`);
+      await audit(a, sent ? 'reset_code_sent' : 'reset_code_mail_failed', 'admin', a.id);
+      return send(res, 200, generic);
+    }
+    if (ap === '/reset' && m === 'POST') {
+      if (limited('r|' + ip(req), 10)) throw new HttpError(429, 'Too many attempts');
+      if (origin && !CORS.includes(origin)) throw new HttpError(403, 'Forbidden');
+      const b = await body(req), email = String(b.email || '').toLowerCase().trim(), code = String(b.code || '').trim(), pw = String(b.password || '');
+      const fail = new HttpError(400, 'Invalid or expired code');
+      if (pw.length < 12) throw bad('New password must be at least 12 characters');
+      if (pw.length > 200) throw bad('Password too long');
+      const a = email.includes('@') ? await one('SELECT * FROM admins WHERE email=?', email) : null;
+      if (!a || !/^\d{6}$/.test(code)) throw fail;
+      const r = await one('SELECT * FROM password_resets WHERE admin_id=? AND used=0 ORDER BY id DESC LIMIT 1', a.id);
+      if (!r || r.expires_at < Date.now() || r.attempts >= 5) throw fail;
+      const good = crypto.timingSafeEqual(Buffer.from(otpHash(a.id, code)), Buffer.from(r.code_hash));
+      if (!good) { await run('UPDATE password_resets SET attempts=attempts+1 WHERE id=?', r.id); throw fail; }
+      await run('UPDATE password_resets SET used=1 WHERE admin_id=?', a.id);
+      await run('UPDATE admins SET password_hash=?,failed=0,locked_until=0 WHERE id=?', hashPw(pw), a.id);
+      await run('DELETE FROM admin_sessions WHERE admin_id=?', a.id); // sign out everywhere
+      await audit(a, 'password_reset', 'admin', a.id);
+      return send(res, 200, { ok: true });
     }
     const s = await sessionOf(req); if (!s) throw new HttpError(401, 'Unauthorized');
     const admin = { id: s.admin_id, role: s.role };

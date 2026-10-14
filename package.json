@@ -10,7 +10,7 @@
   "start": "node src/server.mjs",
   "migrate": "node src/server.mjs --migrate-only",
   "create-admin": "node src/server.mjs --create-admin",
-  "test": "node --disable-warning=ExperimentalWarning --test test/api.test.mjs"
+  "test": "node --disable-warning=ExperimentalWarning --test test/api.test.mjs test/reset.test.mjs"
  },
  "dependencies": {
   "@libsql/client": "^0.15.0"

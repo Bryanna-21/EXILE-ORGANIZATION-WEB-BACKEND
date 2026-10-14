@@ -32,3 +32,14 @@ Strong `ADMIN_SESSION_SECRET` (enforced >=32 in production) · HTTPS only · cor
 Stop or use `sqlite3 data/exile.db ".backup backup.db"` on a schedule; store off-host; restore by replacing the file and restarting.
 ## Known limitations
 No file upload (media = registered external URLs; use object storage/CDN), in-memory rate limiter (single instance), journal content is plain text (escaped), QR image is generated in the browser via cdnjs `qrcodejs`.
+
+## Password reset (email OTP)
+`POST /api/admin/forgot {email}` always answers the same generic 200; if the admin exists a 6-digit code (stored only as a salted hash, valid 10 min, max 3 per hour, newest code only) is emailed through Resend. `POST /api/admin/reset {email, code, password}` checks the code (5 wrong guesses burn it), sets the new password (12+ chars), and signs out every session. Env vars: `RESEND_API_KEY`, optional `MAIL_FROM`. Without a verified domain Resend only delivers to the address you signed up with, which is enough for a single admin. Table: `password_resets` (migration 003, applied automatically on start).
+
+### Locked out and email is not set up yet
+Run the reset from your own computer against the production database:
+```
+npm install
+DATABASE_URL=libsql://... DATABASE_AUTH_TOKEN=... ADMIN_SESSION_SECRET=<same as Vercel> ADMIN_BOOTSTRAP_EMAIL=you@example.com ADMIN_BOOTSTRAP_PASSWORD='a-new-12+char-password' NODE_ENV=production npm run create-admin
+```
+It resets that admin's password and clears any lockout. Do not commit these values.
