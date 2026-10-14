@@ -66,7 +66,11 @@ if (process.argv.includes('--create-admin')) {
 
 // Auto-bootstrap: only when NO admin exists and bootstrap env vars are set (useful where there is no shell).
 { const em = (E.ADMIN_BOOTSTRAP_EMAIL || '').toLowerCase(), pw = E.ADMIN_BOOTSTRAP_PASSWORD || '';
-  if (!(await one('SELECT 1 x FROM admins')) && em.includes('@') && pw.length >= 12) { (await run('INSERT INTO admins(email,password_hash) VALUES(?,?)', em, hashPw(pw))); console.log('First SuperAdmin created. Remove ADMIN_BOOTSTRAP_PASSWORD from env now.'); } }
+  if (E.ADMIN_FORCE_RESET === '1' && em.includes('@') && pw.length >= 12) {
+    const ex = await one('SELECT id FROM admins WHERE email=?', em);
+    if (ex) { await run('UPDATE admins SET password_hash=?,failed=0,locked_until=0 WHERE id=?', hashPw(pw), ex.id); await run('DELETE FROM admin_sessions WHERE admin_id=?', ex.id).catch(() => {}); console.log('Admin password reset via ADMIN_FORCE_RESET. Remove ADMIN_FORCE_RESET and ADMIN_BOOTSTRAP_PASSWORD from env now.'); }
+    else { await run('INSERT INTO admins(email,password_hash) VALUES(?,?)', em, hashPw(pw)); console.log('Admin created via ADMIN_FORCE_RESET. Remove it from env now.'); }
+  } else if (!(await one('SELECT 1 x FROM admins')) && em.includes('@') && pw.length >= 12) { (await run('INSERT INTO admins(email,password_hash) VALUES(?,?)', em, hashPw(pw))); console.log('First SuperAdmin created. Remove ADMIN_BOOTSTRAP_PASSWORD from env now.'); } }
 
 // ---------- email (Resend HTTPS API; no extra dependency) ----------
 const otpHash = (adminId, code) => sha(`${SECRET}|otp|${adminId}|${code}`);
