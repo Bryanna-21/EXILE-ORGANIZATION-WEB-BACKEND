@@ -54,6 +54,18 @@ const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 const hashPw = pw => { const salt = crypto.randomBytes(16); return `scrypt$${salt.toString('hex')}$${crypto.scryptSync(pw, salt, 64).toString('hex')}`; };
 const checkPw = (pw, h) => { const [, s, k] = h.split('$'); const d = crypto.scryptSync(pw, Buffer.from(s, 'hex'), 64); return crypto.timingSafeEqual(d, Buffer.from(k, 'hex')); };
 const DUMMY = hashPw('dummy-password-for-timing');
+// ---- authenticator (TOTP, RFC 6238) + recovery codes: a one-time-code system with no outside service ----
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const b32enc = buf => { let bits = '', out = ''; for (const x of buf) bits += x.toString(2).padStart(8, '0'); for (let i = 0; i < bits.length; i += 5) out += B32[parseInt(bits.slice(i, i + 5).padEnd(5, '0'), 2)]; return out; };
+const b32dec = str => { let bits = ''; for (const c of str.replace(/=+$/, '').toUpperCase()) { const v = B32.indexOf(c); if (v >= 0) bits += v.toString(2).padStart(5, '0'); } const o = []; for (let i = 0; i + 8 <= bits.length; i += 8) o.push(parseInt(bits.slice(i, i + 8), 2)); return Buffer.from(o); };
+const hotp = (key, counter) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(counter)); const h = crypto.createHmac('sha1', key).update(b).digest(), o = h[19] & 15; return String((((h[o] & 0x7f) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 1e6).padStart(6, '0'); };
+// returns the matched 30s time-step (accepts +/-1 step for clock drift) or 0. A step <= lastStep is a replay and is refused.
+const totpCheck = (secretB32, code, lastStep) => { const key = b32dec(secretB32), now = Math.floor(Date.now() / 30000); for (const d of [0, -1, 1]) { const st = now + d; if (st > lastStep && crypto.timingSafeEqual(Buffer.from(hotp(key, st)), Buffer.from(code))) return st; } return 0; };
+const encKey = () => crypto.createHash('sha256').update(SECRET + '|totp-at-rest').digest();
+const encSecret = t => { const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', encKey(), iv), ct = Buffer.concat([c.update(t, 'utf8'), c.final()]); return [iv, c.getAuthTag(), ct].map(x => x.toString('base64')).join('.'); };
+const decSecret = t => { const [iv, tag, ct] = t.split('.').map(x => Buffer.from(x, 'base64')), d = crypto.createDecipheriv('aes-256-gcm', encKey(), iv); d.setAuthTag(tag); return Buffer.concat([d.update(ct), d.final()]).toString('utf8'); };
+const rcHash = (adminId, code) => sha(`${SECRET}|recovery|${adminId}|${code}`);
+const newRecoveryCodes = () => Array.from({ length: 8 }, () => { const h = crypto.randomBytes(4).toString('hex'); return h.slice(0, 4) + '-' + h.slice(4); });
 
 if (process.argv.includes('--migrate-only')) process.exit(0);
 if (process.argv.includes('--create-admin')) {
@@ -129,7 +141,7 @@ const ip = req => (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
 const body = req => req.body !== undefined && req.body !== null ? Promise.resolve().then(() => { const j = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString() || '{}') : req.body; if (typeof j !== 'object' || j === null || Array.isArray(j)) throw bad('Invalid JSON'); return j; }).catch(e => { throw e instanceof HttpError ? e : bad('Invalid JSON'); }) : new Promise((res, rej) => { let n = 0; const b = []; req.on('data', d => { n += d.length; if (n > 1e6) { rej(new HttpError(413, 'Request too large')); req.destroy(); } else b.push(d); }); req.on('end', () => { if (!b.length) return res({}); try { const j = JSON.parse(Buffer.concat(b)); if (typeof j !== 'object' || j === null || Array.isArray(j)) throw 0; res(j); } catch { rej(bad('Invalid JSON')); } }); });
 const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')).filter(a => a[0]).map(([k, ...v]) => [k, v.join('=')]));
 function send(res, status, data, extra = {}) { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...extra }); res.end(JSON.stringify(data)); }
-async function sessionOf(req) { const t = cookies(req).exile_sid; if (!t) return null; const s = (await one('SELECT s.*,a.email,a.role FROM admin_sessions s JOIN admins a ON a.id=s.admin_id WHERE token_hash=?', sha(t))); if (!s || s.expires_at < Date.now()) return null; return s; }
+async function sessionOf(req) { const t = cookies(req).exile_sid; if (!t) return null; const s = (await one('SELECT s.*,a.email,a.role,a.totp_enabled FROM admin_sessions s JOIN admins a ON a.id=s.admin_id WHERE token_hash=?', sha(t))); if (!s || s.expires_at < Date.now()) return null; return s; }
 const cookie = (v, maxAge) => `exile_sid=${v}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=${E.COOKIE_SAMESITE || 'Lax'}${PROD || E.COOKIE_SAMESITE === 'None' ? '; Secure' : ''}`;
 const ROLES = { SUPERADMIN: ['*'] }; // extend: EDITOR: ['content'], ANALYST: ['stats'] ...
 const can = (role, perm) => (ROLES[role] || []).some(p => p === '*' || p === perm);
@@ -239,18 +251,30 @@ export default async function handler(req, res) {
       return send(res, 200, generic);
     }
     if (ap === '/reset' && m === 'POST') {
-      if (limited('r|' + ip(req), 10)) throw new HttpError(429, 'Too many attempts');
+      if (limited('r|' + ip(req), num(E.RESET_RATE_LIMIT_PER_MIN, 10))) throw new HttpError(429, 'Too many attempts');
       if (origin && !CORS.includes(origin)) throw new HttpError(403, 'Forbidden');
       const b = await body(req), email = String(b.email || '').toLowerCase().trim(), code = String(b.code || '').trim(), pw = String(b.password || '');
       const fail = new HttpError(400, 'Invalid or expired code');
       if (pw.length < 12) throw bad('New password must be at least 12 characters');
       if (pw.length > 200) throw bad('Password too long');
       const a = email.includes('@') ? await one('SELECT * FROM admins WHERE email=?', email) : null;
-      if (!a || !/^\d{6}$/.test(code)) throw fail;
-      const r = await one('SELECT * FROM password_resets WHERE admin_id=? AND used=0 ORDER BY id DESC LIMIT 1', a.id);
-      if (!r || r.expires_at < Date.now() || r.attempts >= 5) throw fail;
-      const good = crypto.timingSafeEqual(Buffer.from(otpHash(a.id, code)), Buffer.from(r.code_hash));
-      if (!good) { await run('UPDATE password_resets SET attempts=attempts+1 WHERE id=?', r.id); throw fail; }
+      if (!a) { await new Promise(r => setTimeout(r, 500)); throw fail; }
+      if (a.totp_locked_until > Date.now()) throw new HttpError(400, 'Too many wrong codes. Try again in 15 minutes.');
+      // Accepted proofs: authenticator code, one-time recovery code, or (if mail is configured) the emailed code.
+      let ok = false;
+      if (a.totp_enabled && a.totp_secret) {
+        if (/^\d{6}$/.test(code)) { const st = totpCheck(decSecret(a.totp_secret), code, a.totp_last); if (st) { await run('UPDATE admins SET totp_last=? WHERE id=?', st, a.id); ok = true; } }
+        else if (/^[0-9a-f]{4}-?[0-9a-f]{4}$/i.test(code)) { const rc = await one('SELECT id FROM recovery_codes WHERE admin_id=? AND code_hash=? AND used=0', a.id, rcHash(a.id, code.replace('-', '').toLowerCase())); if (rc) { await run('UPDATE recovery_codes SET used=1 WHERE id=?', rc.id); ok = true; } }
+      }
+      if (!ok && /^\d{6}$/.test(code)) {
+        const r = await one('SELECT * FROM password_resets WHERE admin_id=? AND used=0 ORDER BY id DESC LIMIT 1', a.id);
+        if (r && r.expires_at >= Date.now() && r.attempts < 5) {
+          if (crypto.timingSafeEqual(Buffer.from(otpHash(a.id, code)), Buffer.from(r.code_hash))) { ok = true; await run('UPDATE password_resets SET used=1 WHERE id=?', r.id); }
+          else await run('UPDATE password_resets SET attempts=attempts+1 WHERE id=?', r.id);
+        }
+      }
+      if (!ok) { const f = a.totp_fails + 1; await run('UPDATE admins SET totp_fails=?,totp_locked_until=? WHERE id=?', f >= 5 ? 0 : f, f >= 5 ? Date.now() + 15 * 60e3 : 0, a.id); await audit(a, 'reset_code_failed', 'admin', a.id); throw fail; }
+      await run('UPDATE admins SET totp_fails=0,totp_locked_until=0 WHERE id=?', a.id);
       await run('UPDATE password_resets SET used=1 WHERE admin_id=?', a.id);
       await run('UPDATE admins SET password_hash=?,failed=0,locked_until=0 WHERE id=?', hashPw(pw), a.id);
       await run('DELETE FROM admin_sessions WHERE admin_id=?', a.id); // sign out everywhere
@@ -260,8 +284,33 @@ export default async function handler(req, res) {
     const s = await sessionOf(req); if (!s) throw new HttpError(401, 'Unauthorized');
     const admin = { id: s.admin_id, role: s.role };
     if (!can(admin.role, 'content')) throw new HttpError(403, 'Forbidden');
-    if (ap === '/me') return send(res, 200, { email: s.email, role: s.role, csrf: s.csrf });
+    if (ap === '/me') return send(res, 200, { email: s.email, role: s.role, csrf: s.csrf, totp: !!s.totp_enabled });
     if (m !== 'GET') { if (req.headers['x-csrf-token'] !== s.csrf || (origin && !CORS.includes(origin))) throw new HttpError(403, 'CSRF check failed'); }
+    // ---- authenticator setup (enable / disable) ----
+    if (ap === '/totp/setup' && m === 'POST') {
+      const a = await one('SELECT * FROM admins WHERE id=?', admin.id); if (a.totp_enabled) throw bad('Authenticator is already enabled. Disable it first to set up a new one.');
+      const secret = b32enc(crypto.randomBytes(20));
+      await run('UPDATE admins SET totp_secret=?,totp_enabled=0,totp_last=0 WHERE id=?', encSecret(secret), a.id);
+      return send(res, 200, { secret, uri: `otpauth://totp/Exile%20Admin:${encodeURIComponent(a.email)}?secret=${secret}&issuer=Exile%20Admin&algorithm=SHA1&digits=6&period=30` });
+    }
+    if (ap === '/totp/enable' && m === 'POST') {
+      const b = await body(req), a = await one('SELECT * FROM admins WHERE id=?', admin.id), code = String(b.code || '').replace(/\s/g, '');
+      if (!a.totp_secret || a.totp_enabled) throw bad('Start the setup first');
+      const st = /^\d{6}$/.test(code) ? totpCheck(decSecret(a.totp_secret), code, 0) : 0; if (!st) throw bad('That code is not valid. Check your phone clock and try the next code.');
+      const codes = newRecoveryCodes();
+      await run('DELETE FROM recovery_codes WHERE admin_id=?', a.id);
+      for (const c of codes) await run('INSERT INTO recovery_codes(admin_id,code_hash) VALUES(?,?)', a.id, rcHash(a.id, c.replace('-', '')));
+      await run('UPDATE admins SET totp_enabled=1,totp_last=?,totp_fails=0,totp_locked_until=0 WHERE id=?', st, a.id);
+      await audit(admin, 'totp_enabled', 'admin', a.id); return send(res, 200, { ok: true, recovery: codes });
+    }
+    if (ap === '/totp/disable' && m === 'POST') {
+      const b = await body(req), a = await one('SELECT * FROM admins WHERE id=?', admin.id), code = String(b.code || '').replace(/\s/g, '');
+      if (!a.totp_enabled) throw bad('Authenticator is not enabled');
+      const st = /^\d{6}$/.test(code) ? totpCheck(decSecret(a.totp_secret), code, a.totp_last) : 0;
+      if (!checkPw(String(b.password || ''), a.password_hash) || !st) throw bad('Wrong password or code');
+      await run('UPDATE admins SET totp_secret=NULL,totp_enabled=0,totp_last=0 WHERE id=?', a.id); await run('DELETE FROM recovery_codes WHERE admin_id=?', a.id);
+      await audit(admin, 'totp_disabled', 'admin', a.id); return send(res, 200, { ok: true });
+    }
     if (ap === '/logout' && m === 'POST') { (await run('DELETE FROM admin_sessions WHERE id=?', s.id)); await audit(admin, 'logout', 'admin', admin.id); return send(res, 200, { ok: true }, { 'set-cookie': cookie('', 0) }); }
     if (ap === '/stats') return send(res, 200, await stats());
     if (ap === '/system') return send(res, 200, { api: 'ok', db: (await one('SELECT 1 x')).x === 1 ? 'ok' : 'down', storage: 'external URLs (no local uploads)', node: process.version });

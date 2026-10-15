@@ -43,3 +43,16 @@ npm install
 DATABASE_URL=libsql://... DATABASE_AUTH_TOKEN=... ADMIN_SESSION_SECRET=<same as Vercel> ADMIN_BOOTSTRAP_EMAIL=you@example.com ADMIN_BOOTSTRAP_PASSWORD='a-new-12+char-password' NODE_ENV=production npm run create-admin
 ```
 It resets that admin's password and clears any lockout. Do not commit these values.
+
+
+## Authenticator (TOTP) password recovery: no email service needed
+
+The admin can pair an authenticator app (Google Authenticator, Authy, 1Password, ...) under **Account -> Authenticator**.
+Setup shows a QR code and 8 one-time recovery codes. After that, **Forgot password?** accepts the 6-digit app code (or a recovery code) plus a new password.
+
+- RFC 6238 (SHA-1, 6 digits, 30 s) implemented with `node:crypto`; no dependency, no third party.
+- The secret is encrypted at rest (AES-256-GCM, key derived from `ADMIN_SESSION_SECRET`); recovery codes are stored hashed.
+- Each code works once (replay-protected), +/-1 step of clock drift allowed.
+- 5 wrong codes lock resets for 15 minutes. `RESET_RATE_LIMIT_PER_MIN` (default 10) limits requests per IP.
+- Changing `ADMIN_SESSION_SECRET` makes stored authenticator secrets unreadable: disable-by-reset and set up again (see break-glass below).
+- Break-glass if you lose both phone and recovery codes: set `ADMIN_FORCE_RESET=1`, `ADMIN_BOOTSTRAP_EMAIL`, `ADMIN_BOOTSTRAP_PASSWORD` in the host env and redeploy, sign in, then **remove those variables**.
